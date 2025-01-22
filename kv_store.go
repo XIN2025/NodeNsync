@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/gob"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -12,11 +13,12 @@ import (
 )
 
 type KVStore struct {
-	mu       sync.RWMutex
-	data     map[string]*KeyValue
-	config   *ServerConfig
-	metrics  *Metrics
-	snapshot *SnapshotManager
+	mu                 sync.RWMutex
+	data               map[string]*KeyValue
+	config             *ServerConfig
+	metrics            *Metrics
+	snapshot           *SnapshotManager
+	replicationManager *ReplicationManager // Add this field
 }
 
 type KeyValue struct {
@@ -28,14 +30,15 @@ type KeyValue struct {
 	ExpiresAt time.Time
 }
 
-func NewKVStore(config *ServerConfig, metrics *Metrics) *KVStore {
+func NewKVStore(config *ServerConfig, metrics *Metrics, replicationManager *ReplicationManager) *KVStore {
 	if config.SnapshotInterval <= 0 {
 		panic("SnapshotInterval must be greater than 0")
 	}
 	kv := &KVStore{
-		data:    make(map[string]*KeyValue),
-		config:  config,
-		metrics: metrics,
+		data:               make(map[string]*KeyValue),
+		config:             config,
+		metrics:            metrics,
+		replicationManager: replicationManager, // Initialize the replicationManager
 	}
 	kv.snapshot = NewSnapshotManager(kv, config)
 	go kv.cleanupLoop()
@@ -56,8 +59,41 @@ func (kv *KVStore) Set(key string, value []byte, ttl time.Duration) error {
 		ExpiresAt: expiresAt,
 	}
 
+	slog.Info("Set key in KV store", "key", key, "value", value)
 	atomic.AddUint64(&kv.metrics.KeyCount, 1)
+
+	// Broadcast the SET command to replicas
+	if kv.replicationManager != nil {
+		kv.replicationManager.BroadcastToReplicas(ReplicationCommand{
+			Operation: "SET",
+			Key:       key,
+			Value:     value,
+			TTL:       ttl,
+		})
+	}
+
 	return nil
+}
+
+func (kv *KVStore) Delete(key string) bool {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	if _, exists := kv.data[key]; exists {
+		delete(kv.data, key)
+		atomic.AddUint64(&kv.metrics.KeyCount, ^uint64(0))
+
+		// Broadcast the DEL command to replicas
+		if kv.replicationManager != nil {
+			kv.replicationManager.BroadcastToReplicas(ReplicationCommand{
+				Operation: "DEL",
+				Key:       key,
+			})
+		}
+
+		return true
+	}
+	return false
 }
 
 func (kv *KVStore) Get(key string) ([]byte, bool) {
@@ -69,23 +105,12 @@ func (kv *KVStore) Get(key string) ([]byte, bool) {
 		return nil, false
 	}
 
+	slog.Info("Retrieved key from KV store", "key", key, "value", val.Value)
 	if !val.ExpiresAt.IsZero() && time.Now().After(val.ExpiresAt) {
 		return nil, false
 	}
 
 	return val.Value, true
-}
-
-func (kv *KVStore) Delete(key string) bool {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-
-	if _, exists := kv.data[key]; exists {
-		delete(kv.data, key)
-		atomic.AddUint64(&kv.metrics.KeyCount, ^uint64(0))
-		return true
-	}
-	return false
 }
 
 func (kv *KVStore) cleanupLoop() {

@@ -2,11 +2,8 @@ package main
 
 import (
 	"fmt"
-	"io"
 	"log/slog"
-	"net"
 	"strconv"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -81,7 +78,10 @@ func (h *CommandHandler) HandleCommand(cmd Command, peer *Peer) error {
 		return h.handleInfo(peer)
 	case RoleCommand:
 		return h.handleRole(peer)
+	case SyncCommand:
+		return h.handleSync(peer)
 	case HelpCommand:
+
 		return h.handleHelp(v, peer)
 	case CommandCommand:
 		return h.handleCommand(peer)
@@ -149,74 +149,37 @@ func (h *CommandHandler) handleReplicaOf(cmd ReplicaOfCommand, peer *Peer) error
 	}
 
 	slog.Info("Successfully set as replica", "masterAddr", masterAddr)
-	return resp.NewWriter(peer.conn).WriteString("OK")
+
+	if err := resp.NewWriter(peer.conn).WriteString("OK"); err != nil {
+		return fmt.Errorf("ERR failed to write response: %v", err)
+	}
+
+	return nil
 }
 
 func (h *CommandHandler) handleSync(peer *Peer) error {
-	if err := h.requireAuth(peer); err != nil {
-		return err
-	}
+	slog.Info("Handling SYNC command")
 
-	if h.replicationManager.role != RoleReplica {
-		return fmt.Errorf("ERR this node is not a replica")
-	}
+	// Send all key-value data to the replica
+	h.kv.mu.RLock()
+	defer h.kv.mu.RUnlock()
 
-	masterAddr := h.replicationManager.masterAddr
-	if masterAddr == "" {
-		return fmt.Errorf("ERR no master node configured")
-	}
-
-	conn, err := net.Dial("tcp", masterAddr)
-	if err != nil {
-		return fmt.Errorf("ERR failed to connect to master: %v", err)
-	}
-	defer conn.Close()
-
-	writer := resp.NewWriter(conn)
-	if err := writer.WriteArray([]resp.Value{
-		resp.StringValue("SYNC"),
-	}); err != nil {
-		return fmt.Errorf("ERR failed to send SYNC request: %v", err)
-	}
-
-	reader := resp.NewReader(conn)
-	for {
-		value, _, err := reader.ReadValue()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return fmt.Errorf("ERR failed to read SYNC response: %v", err)
-		}
-
-		if value.Type() == resp.Array {
-			cmd := value.Array()
-			if len(cmd) < 1 {
-				continue
-			}
-
-			switch strings.ToUpper(cmd[0].String()) {
-			case "SET":
-				if len(cmd) < 3 {
-					return fmt.Errorf("ERR invalid SET command in SYNC response")
-				}
-				key := cmd[1].String()
-				value := cmd[2].Bytes()
-				h.kv.Set(key, value, 0)
-			case "DEL":
-				if len(cmd) < 2 {
-					return fmt.Errorf("ERR invalid DEL command in SYNC response")
-				}
-				key := cmd[1].String()
-				h.kv.Delete(key)
-			default:
-				return fmt.Errorf("ERR unknown command in SYNC response: %s", cmd[0].String())
-			}
+	writer := resp.NewWriter(peer.conn)
+	for key, value := range h.kv.data {
+		if err := writer.WriteArray([]resp.Value{
+			resp.StringValue("SET"),
+			resp.StringValue(key),
+			resp.BytesValue(value.Value),
+		}); err != nil {
+			slog.Error("Failed to send key-value data", "err", err)
+			return err
 		}
 	}
 
-	return resp.NewWriter(peer.conn).WriteString("OK")
+	slog.Info("Finished sending key-value data to replica")
+	return nil
 }
+
 func (h *CommandHandler) handleCommand(peer *Peer) error {
 	commands := []string{
 		"PING", "QUIT", "AUTH", "SET", "GET", "DEL", "INCR", "HSET", "HGET",

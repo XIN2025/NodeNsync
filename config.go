@@ -28,9 +28,9 @@ type ServerConfig struct {
 }
 
 func DefaultConfig(overrides ...*ServerConfig) *ServerConfig {
-	// Create a default configuration
+
 	cfg := &ServerConfig{
-		ListenAddr:        ":6379", // Default port
+		ListenAddr:        ":6379",
 		DataDir:           "./data",
 		MaxConnections:    10000,
 		MaxMessageSize:    512 * 1024 * 1024,
@@ -46,12 +46,11 @@ func DefaultConfig(overrides ...*ServerConfig) *ServerConfig {
 		EnableReplicas:    true,
 	}
 
-	// Apply overrides if provided
 	for _, override := range overrides {
 		if override.ListenAddr != "" {
 			cfg.ListenAddr = override.ListenAddr
 		}
-		// Add other fields as needed
+
 	}
 
 	return cfg

@@ -33,12 +33,13 @@ type Server struct {
 
 func NewServer(cfg *ServerConfig) *Server {
 	metrics := NewMetrics()
-	kv := NewKVStore(cfg, metrics)
+	replicationManager := NewReplicationManager(cfg, nil, metrics) // Create ReplicationManager
+	kv := NewKVStore(cfg, metrics, replicationManager)             // Pass ReplicationManager to KVStore
 	authManager := NewAuthManager()
 	clusterManager := NewClusterManager()
 	monitor := NewMonitor()
 	pubsub := NewPubSubManager(cfg, metrics)
-	replicationManager := NewReplicationManager(cfg, kv, metrics)
+	replicationManager.kv = kv // Set the KVStore in the ReplicationManager
 
 	commandHandler := NewCommandHandler(cfg, authManager, clusterManager, kv, metrics, monitor, pubsub, replicationManager)
 
@@ -53,6 +54,7 @@ func NewServer(cfg *ServerConfig) *Server {
 		commandHandler: commandHandler,
 	}
 }
+
 func (s *Server) Start() error {
 
 	if s.SnapshotInterval <= 0 || s.CleanupInterval <= 0 {
@@ -117,6 +119,14 @@ func (s *Server) handleMessage(msg Message) error {
 			}
 		}()
 		return nil
+
+	case ReplicaOfCommand:
+		err := s.commandHandler.HandleCommand(msg.cmd, msg.peer)
+		if err != nil {
+			slog.Error("Command handling error", "err", err, "command", fmt.Sprintf("%T", msg.cmd))
+			return err
+		}
+		return nil
 	case InfoCommand:
 		return s.commandHandler.HandleCommand(v, msg.peer)
 	case RoleCommand:
@@ -127,6 +137,8 @@ func (s *Server) handleMessage(msg Message) error {
 		return s.commandHandler.HandleCommand(v, msg.peer)
 	case HelloCommand:
 		return s.commandHandler.HandleCommand(v, msg.peer)
+	case SyncCommand:
+		return s.commandHandler.handleCommand(msg.peer)
 	default:
 		return fmt.Errorf("ERR unknown command")
 	}
