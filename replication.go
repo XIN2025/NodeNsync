@@ -274,99 +274,6 @@ func (rm *ReplicationManager) handleMasterConnectionPersistent(conn net.Conn) {
 	}
 }
 
-func (rm *ReplicationManager) handleMasterUpdates(conn net.Conn) {
-	defer conn.Close()
-
-	rm.mu.Lock()
-	addr := conn.RemoteAddr().String()
-	rm.replicas[addr] = &ReplicaInfo{
-		Addr:      addr,
-		LastSeen:  time.Now(),
-		IsHealthy: true,
-	}
-	rm.replicas[addr].IsHealthy = true
-	rm.mu.Unlock()
-
-	reader := resp.NewReader(conn)
-	writer := resp.NewWriter(conn)
-
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	go func() {
-		for {
-			select {
-			case <-ticker.C:
-				rm.mu.Lock()
-				rm.replicas[addr].LastSeen = time.Now()
-				rm.mu.Unlock()
-
-				if err := writer.WriteString("PING"); err != nil {
-					return
-				}
-			}
-		}
-	}()
-
-	for {
-		val, _, err := reader.ReadValue()
-		if err != nil {
-			rm.mu.Lock()
-			rm.replicas[addr].IsHealthy = false
-			rm.mu.Unlock()
-			return
-		}
-
-		if val.String() == "PONG" {
-			rm.mu.Lock()
-			rm.replicas[addr].LastSeen = time.Now()
-			rm.mu.Unlock()
-		}
-	}
-}
-
-func (rm *ReplicationManager) handleContinuousUpdates(conn net.Conn) {
-	defer conn.Close()
-	reader := resp.NewReader(conn)
-	writer := resp.NewWriter(conn)
-
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	go func() {
-		for range ticker.C {
-			if err := writer.WriteString("PONG"); err != nil {
-				return
-			}
-		}
-	}()
-
-	for {
-		val, _, err := reader.ReadValue()
-		if err != nil {
-			slog.Error("Update stream broken", "error", err)
-			rm.mu.Lock()
-			rm.syncComplete = false
-			rm.mu.Unlock()
-			return
-		}
-
-		switch val.String() {
-		case "PING":
-			writer.WriteString("PONG")
-		default:
-			arr := val.Array()
-			if len(arr) > 0 && arr[0].String() == "REPLDATA" {
-				rm.kv.ApplyReplicationCommand(ReplicationCommand{
-					Operation: "SET",
-					Key:       arr[1].String(),
-					Value:     arr[2].Bytes(),
-				})
-			}
-		}
-	}
-}
-
 func (rm *ReplicationManager) Stop() {
 	close(rm.stopChan)
 	if rm.activeConn != nil {
@@ -491,29 +398,6 @@ func (rm *ReplicationManager) connectAndSync() error {
 	return rm.handlePersistentConnection(conn)
 }
 
-func (rm *ReplicationManager) continuousReplication(conn net.Conn) error {
-	rd := resp.NewReader(conn)
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-
-			writer := resp.NewWriter(conn)
-			if err := writer.WriteArray([]resp.Value{resp.StringValue("PING")}); err != nil {
-				return fmt.Errorf("heartbeat failed: %w", err)
-			}
-		default:
-			conn.SetReadDeadline(time.Time{})
-			_, _, err := rd.ReadValue()
-			if err != nil {
-				return fmt.Errorf("replication read failed: %w", err)
-			}
-
-		}
-	}
-}
 func (rm *ReplicationManager) BroadcastToReplicas(cmd ReplicationCommand) {
 	rm.mu.RLock()
 	defer rm.mu.RUnlock()
@@ -529,28 +413,6 @@ func (rm *ReplicationManager) BroadcastToReplicas(cmd ReplicationCommand) {
 		if err := writer.WriteArray(data); err != nil {
 			slog.Error("Broadcast failed", "replica", addr, "err", err)
 		}
-	}
-}
-
-func (rm *ReplicationManager) healthCheckLoop() {
-	ticker := time.NewTicker(rm.config.HeartbeatInterval)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		rm.mu.Lock()
-		now := time.Now()
-
-		for addr, replica := range rm.replicas {
-			if now.Sub(replica.LastSeen) > rm.config.ConnectionTimeout {
-				slog.Warn("Replica timeout", "addr", addr)
-				replica.IsHealthy = false
-				if conn, exists := rm.replicaConns[addr]; exists {
-					conn.Close()
-					delete(rm.replicaConns, addr)
-				}
-			}
-		}
-		rm.mu.Unlock()
 	}
 }
 

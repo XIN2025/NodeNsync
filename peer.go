@@ -62,218 +62,145 @@ func (p *Peer) ExitSubscribedMode() {
 	defer p.mu.Unlock()
 	p.inSubscribedMode = false
 }
-
 func (p *Peer) readLoop() error {
-	rd := resp.NewReader(p.conn)
+	defer func() {
+		p.conn.Close()
+		p.delCh <- p
+		slog.Info("Connection closed", "remote", p.conn.RemoteAddr())
+	}()
+
+	reader := resp.NewReader(p.conn)
+	writer := resp.NewWriter(p.conn)
+
 	for {
-		v, _, err := rd.ReadValue()
-		if err == io.EOF {
-			slog.Info("Client disconnected", "remoteAddr", p.conn.RemoteAddr())
-			p.delCh <- p
-			break
-		}
+		// Read RESP value from connection
+		val, _, err := reader.ReadValue()
 		if err != nil {
-			slog.Error("Read error", "err", err)
+			if err == io.EOF {
+				slog.Debug("Client closed connection", "remote", p.conn.RemoteAddr())
+				return nil
+			}
+			slog.Error("Read error", "remote", p.conn.RemoteAddr(), "error", err)
 			return err
 		}
 
-		if v.Type() == resp.Array {
-			rawCMD := v.Array()[0].String()
-			args := v.Array()[1:]
-			var cmd Command
+		// Validate command structure
+		if val.Type() != resp.Array || len(val.Array()) == 0 {
+			slog.Warn("Invalid command format", "remote", p.conn.RemoteAddr())
+			writer.WriteError(fmt.Errorf("ERR invalid command format"))
+			continue
+		}
 
-			slog.Info("Received command", "command", rawCMD, "args", args)
+		cmdParts := val.Array()
+		rawCmd := strings.ToUpper(cmdParts[0].String())
+		args := cmdParts[1:]
 
-			switch strings.ToUpper(rawCMD) {
-			// In peer.go's readLoop
-			case "REPLACK":
-				cmd = ReplAckCommand{}
-				// ... other cases ...
-			case "AUTH":
-				if len(args) < 2 {
-					writer := resp.NewWriter(p.conn)
-					if err := writer.WriteError(fmt.Errorf("ERR wrong number of arguments for 'AUTH' command")); err != nil {
-						return err
-					}
-					continue
-				}
-				cmd = AuthCommand{
-					username: args[0].String(),
-					password: args[1].String(),
-				}
-			case "PING":
-				cmd = PingCommand{}
-			case "QUIT":
-				cmd = QuitCommand{}
-			case "SET":
-				if len(args) < 2 {
-					writer := resp.NewWriter(p.conn)
-					if err := writer.WriteError(fmt.Errorf("ERR wrong number of arguments for 'SET' command")); err != nil {
-						return err
-					}
-					continue
-				}
-				cmd = SetCommand{
-					key:   args[0].Bytes(),
-					value: args[1].Bytes(),
-				}
-			case "GET":
-				if len(args) < 1 {
-					writer := resp.NewWriter(p.conn)
-					if err := writer.WriteError(fmt.Errorf("ERR wrong number of arguments for 'GET' command")); err != nil {
-						return err
-					}
-					continue
-				}
-				cmd = GetCommand{
-					key: args[0].Bytes(),
-				}
-			case "DEL":
-				if len(args) < 1 {
-					writer := resp.NewWriter(p.conn)
-					if err := writer.WriteError(fmt.Errorf("ERR wrong number of arguments for 'DEL' command")); err != nil {
-						return err
-					}
-					continue
-				}
-				cmd = DelCommand{
-					key: args[0].Bytes(),
-				}
-			case "INCR":
-				if len(args) < 1 {
-					writer := resp.NewWriter(p.conn)
-					if err := writer.WriteError(fmt.Errorf("ERR wrong number of arguments for 'INCR' command")); err != nil {
-						return err
-					}
-					continue
-				}
-				cmd = IncrCommand{
-					key: args[0].Bytes(),
-				}
-			case "HSET":
-				if len(args) < 2 {
-					writer := resp.NewWriter(p.conn)
-					if err := writer.WriteError(fmt.Errorf("ERR wrong number of arguments for 'HSET' command")); err != nil {
-						return err
-					}
-					continue
-				}
-				key := args[0].Bytes()
-				field := []byte("default")
-				value := args[1].Bytes()
-				if len(args) >= 3 {
-					field = args[1].Bytes()
-					value = args[2].Bytes()
-				}
-				cmd = HSetCommand{
-					key:   key,
-					field: field,
-					value: value,
-				}
-			case "HGET":
-				if len(args) < 2 {
-					writer := resp.NewWriter(p.conn)
-					if err := writer.WriteError(fmt.Errorf("ERR wrong number of arguments for 'HGET' command")); err != nil {
-						return err
-					}
-					continue
-				}
-				cmd = HGetCommand{
-					key:   args[0].Bytes(),
-					field: args[1].Bytes(),
-				}
-			case "PUBLISH":
-				if len(args) < 2 {
-					writer := resp.NewWriter(p.conn)
-					if err := writer.WriteError(fmt.Errorf("ERR wrong number of arguments for 'PUBLISH' command")); err != nil {
-						return err
-					}
-					continue
-				}
-				channel := args[0].String()
-				var messageParts []string
-				for _, arg := range args[1:] {
-					messageParts = append(messageParts, arg.String())
-				}
-				message := strings.Join(messageParts, " ")
-				cmd = PublishCommand{
-					channel: channel,
-					message: []byte(message),
-				}
-			case "REPLICAOF":
-				if len(args) < 2 {
-					writer := resp.NewWriter(p.conn)
-					if err := writer.WriteError(fmt.Errorf("ERR wrong number of arguments for 'REPLICAOF' command")); err != nil {
-						return err
-					}
-					continue
-				}
-				cmd = ReplicaOfCommand{
-					host: args[0].String(),
-					port: args[1].String(),
-				}
-			case "REPLHANDSHAKE":
-				if len(args) < 1 {
-					writer := resp.NewWriter(p.conn)
-					if err := writer.WriteError(fmt.Errorf("ERR wrong number of arguments for 'REPLHANDSHAKE' command")); err != nil {
-						return err
-					}
-					continue
-				}
-				cmd = ReplHandshakeCommand{
-					addr: args[0].String(),
-				}
-			case "SUBSCRIBE":
-				if len(args) < 1 {
-					writer := resp.NewWriter(p.conn)
-					if err := writer.WriteError(fmt.Errorf("ERR wrong number of arguments for 'SUBSCRIBE' command")); err != nil {
-						return err
-					}
-					continue
-				}
-				cmd = SubscribeCommand{
-					channel: args[0].String(),
-				}
-			case "UNSUBSCRIBE":
-				channels := argsToStrings(args)
-				cmd = UnsubscribeCommand{
-					channels: channels,
-				}
-
-			case "MONITOR":
-				cmd = MonitorCommand{}
-			case "INFO":
-				cmd = InfoCommand{}
-			case "ROLE":
-				cmd = RoleCommand{}
-			case "HELP":
-				cmd = HelpCommand{}
-			case "COMMAND":
-				cmd = CommandCommand{}
-			case "HELLO":
-				cmd = HelloCommand{}
-			case "SYNC":
-				slog.Info("Received SYNC command")
-				p.msgCh <- Message{
-					cmd:  SyncCommand{},
-					peer: p,
-				}
-			default:
-				slog.Error("Unknown command", "command", rawCMD)
-				writer := resp.NewWriter(p.conn)
-				if err := writer.WriteError(fmt.Errorf("ERR unknown command '%s'", rawCMD)); err != nil {
-					return err
-				}
+		// Rate limiting check
+		if p.server != nil && p.server.Config.RateLimit > 0 {
+			clientIP, _, _ := net.SplitHostPort(p.conn.RemoteAddr().String())
+			if !p.server.rateLimiter.Allow(clientIP) {
+				errMsg := fmt.Sprintf("ERR rate limit exceeded (max %d commands/second)",
+					p.server.Config.RateLimit)
+				slog.Warn("Rate limit blocked", "client", clientIP)
+				writer.WriteError(fmt.Errorf(errMsg))
 				continue
 			}
-
-			p.msgCh <- Message{
-				cmd:  cmd,
-				peer: p,
-			}
 		}
+
+		// Parse command and handle errors
+		var cmd Command
+		switch rawCmd {
+		case "AUTH":
+			if len(args) < 2 {
+				writer.WriteError(fmt.Errorf("ERR wrong number of arguments for 'AUTH'"))
+				continue
+			}
+			cmd = AuthCommand{
+				username: args[0].String(),
+				password: args[1].String(),
+			}
+
+		case "PING":
+			cmd = PingCommand{}
+
+		case "SET":
+			if len(args) < 2 {
+				writer.WriteError(fmt.Errorf("ERR wrong number of arguments for 'SET'"))
+				continue
+			}
+			cmd = SetCommand{
+				key:   args[0].Bytes(),
+				value: args[1].Bytes(),
+			}
+
+		case "GET":
+			if len(args) < 1 {
+				writer.WriteError(fmt.Errorf("ERR wrong number of arguments for 'GET'"))
+				continue
+			}
+			cmd = GetCommand{
+				key: args[0].Bytes(),
+			}
+
+		case "DEL":
+			if len(args) < 1 {
+				writer.WriteError(fmt.Errorf("ERR wrong number of arguments for 'DEL'"))
+				continue
+			}
+			cmd = DelCommand{
+				key: args[0].Bytes(),
+			}
+
+		case "INCR":
+			if len(args) < 1 {
+				writer.WriteError(fmt.Errorf("ERR wrong number of arguments for 'INCR'"))
+				continue
+			}
+			cmd = IncrCommand{
+				key: args[0].Bytes(),
+			}
+
+		case "HSET":
+			if len(args) < 3 {
+				writer.WriteError(fmt.Errorf("ERR wrong number of arguments for 'HSET'"))
+				continue
+			}
+			cmd = HSetCommand{
+				key:   args[0].Bytes(),
+				field: args[1].Bytes(),
+				value: args[2].Bytes(),
+			}
+
+		case "HGET":
+			if len(args) < 2 {
+				writer.WriteError(fmt.Errorf("ERR wrong number of arguments for 'HGET'"))
+				continue
+			}
+			cmd = HGetCommand{
+				key:   args[0].Bytes(),
+				field: args[1].Bytes(),
+			}
+
+		case "QUIT":
+			writer.WriteString("OK")
+			return nil
+
+		default:
+			writer.WriteError(fmt.Errorf("ERR unknown command '%s'", rawCmd))
+			continue
+		}
+
+		// Send command to handler
+		p.msgCh <- Message{
+			cmd:  cmd,
+			peer: p,
+		}
+
+		// Update last activity time
+		p.mu.Lock()
+		p.lastActivity = time.Now()
+		p.mu.Unlock()
 	}
-	return nil
 }
 
 func (p *Peer) IsActive() bool {

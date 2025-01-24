@@ -1,12 +1,7 @@
 package main
 
 import (
-	"encoding/gob"
-	"fmt"
 	"log/slog"
-	"os"
-	"path/filepath"
-	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -71,7 +66,10 @@ func (kv *KVStore) Set(key string, value []byte, ttl time.Duration) error {
 	}
 
 	kv.data[key] = &KeyValue{
+		Type:      "string",
 		Value:     value,
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
 		ExpiresAt: expiresAt,
 	}
 
@@ -162,130 +160,6 @@ func (kv *KVStore) cleanupExpired() {
 type SnapshotManager struct {
 	kv     *KVStore
 	config *ServerConfig
-}
-
-func NewSnapshotManager(kv *KVStore, config *ServerConfig) *SnapshotManager {
-	if config.SnapshotInterval <= 0 {
-		panic("SnapshotInterval must be greater than 0")
-	}
-	sm := &SnapshotManager{
-		kv:     kv,
-		config: config,
-	}
-	go sm.autoSnapshotLoop()
-	return sm
-}
-
-func (sm *SnapshotManager) autoSnapshotLoop() {
-	ticker := time.NewTicker(sm.config.SnapshotInterval)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		if err := sm.CreateSnapshot(); err != nil {
-
-			continue
-		}
-	}
-}
-
-func (sm *SnapshotManager) CreateSnapshot() error {
-
-	file, err := os.CreateTemp(sm.config.DataDir, "snapshot-*.tmp")
-	if err != nil {
-		return fmt.Errorf("failed to create temp file: %w", err)
-	}
-	defer file.Close()
-
-	sm.kv.mu.RLock()
-	defer sm.kv.mu.RUnlock()
-
-	encoder := gob.NewEncoder(file)
-	if err := encoder.Encode(sm.kv.data); err != nil {
-		return fmt.Errorf("failed to encode data: %w", err)
-	}
-
-	finalPath := fmt.Sprintf("%s/snapshot-%d.db", sm.config.DataDir, time.Now().UnixNano())
-	if err := os.Rename(file.Name(), finalPath); err != nil {
-		return fmt.Errorf("failed to rename snapshot: %w", err)
-	}
-
-	return sm.cleanupOldSnapshots()
-}
-
-func (sm *SnapshotManager) LoadLatestSnapshot() error {
-	entries, err := os.ReadDir(sm.config.DataDir)
-	if err != nil {
-		return fmt.Errorf("failed to read data directory: %w", err)
-	}
-
-	var latestFile string
-	var latestTime int64
-
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		if matched, _ := filepath.Match("snapshot-*.db", entry.Name()); !matched {
-			continue
-		}
-
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-
-		if info.ModTime().UnixNano() > latestTime {
-			latestFile = entry.Name()
-			latestTime = info.ModTime().UnixNano()
-		}
-	}
-
-	if latestFile == "" {
-		return nil
-	}
-
-	file, err := os.Open(filepath.Join(sm.config.DataDir, latestFile))
-	if err != nil {
-		return fmt.Errorf("failed to open snapshot: %w", err)
-	}
-	defer file.Close()
-
-	decoder := gob.NewDecoder(file)
-	sm.kv.mu.Lock()
-	defer sm.kv.mu.Unlock()
-
-	return decoder.Decode(&sm.kv.data)
-}
-
-func (sm *SnapshotManager) cleanupOldSnapshots() error {
-	entries, err := os.ReadDir(sm.config.DataDir)
-	if err != nil {
-		return err
-	}
-
-	var snapshots []string
-	for _, entry := range entries {
-		if matched, _ := filepath.Match("snapshot-*.db", entry.Name()); matched {
-			snapshots = append(snapshots, entry.Name())
-		}
-	}
-
-	if len(snapshots) <= 3 {
-		return nil
-	}
-
-	sort.Slice(snapshots, func(i, j int) bool {
-		return snapshots[i] > snapshots[j]
-	})
-
-	for _, snapshot := range snapshots[3:] {
-		if err := os.Remove(filepath.Join(sm.config.DataDir, snapshot)); err != nil {
-
-			continue
-		}
-	}
-
-	return nil
 }
 
 type Monitor struct {

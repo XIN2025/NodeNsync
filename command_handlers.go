@@ -1,14 +1,18 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"strconv"
 	"sync/atomic"
 	"time"
 
 	"github.com/tidwall/resp"
 )
+
+var ErrResponseSent = errors.New("response already sent")
 
 type CommandHandler struct {
 	authManager        *AuthManager
@@ -80,6 +84,17 @@ func (h *CommandHandler) handleReplicaOf(cmd *ReplicaOfCommand, peer *Peer) erro
 func (h *CommandHandler) HandleCommand(cmd Command, peer *Peer) error {
 	slog.Info("Handling command", "command", fmt.Sprintf("%T", cmd))
 
+	clientIP, _, _ := net.SplitHostPort(peer.conn.RemoteAddr().String())
+	if h.server.Config.RateLimit > 0 {
+		if !h.server.rateLimiter.TrackCommand(clientIP) {
+			errMsg := fmt.Sprintf("ERR rate limit exceeded (max %d commands/second)",
+				h.server.Config.RateLimit)
+			writer := resp.NewWriter(peer.conn)
+			writer.WriteError(errors.New(errMsg))
+			return errors.New(errMsg)
+		}
+	}
+
 	if h.monitor != nil {
 		cmdStr := formatCommand(cmd)
 		h.monitor.Record(cmdStr)
@@ -127,7 +142,7 @@ func (h *CommandHandler) HandleCommand(cmd Command, peer *Peer) error {
 	case HelpCommand:
 		return h.handleHelp(v, peer)
 	case CommandCommand:
-		return h.handleCommand(peer)
+		return h.handleCommand(v, peer)
 	case HelloCommand:
 		return h.handleHello(peer)
 	default:
@@ -217,16 +232,34 @@ func (h *CommandHandler) handleSync(peer *Peer) error {
 	return nil
 }
 
-func (h *CommandHandler) handleCommand(peer *Peer) error {
-	commands := []string{
-		"PING", "QUIT", "AUTH", "SET", "GET", "DEL", "INCR", "HSET", "HGET",
-		"PUBLISH", "SUBSCRIBE", "UNSUBSCRIBE", "MONITOR", "INFO", "ROLE", "HELP", "COMMAND", "HELLO", "SYNC", "REPLICAOF",
+func (h *CommandHandler) handleCommand(cmd Command, peer *Peer) error {
+	slog.Info("Handling command", "command", fmt.Sprintf("%T", cmd))
+
+	if h.monitor != nil {
+		cmdStr := formatCommand(cmd)
+		h.monitor.Record(cmdStr)
 	}
-	writer := resp.NewWriter(peer.conn)
-	return writer.WriteArray([]resp.Value{
-		resp.StringValue("COMMAND"),
-		resp.ArrayValue(stringsToValues(commands)),
-	})
+
+	var handlerErr error
+	switch v := cmd.(type) {
+	case AuthCommand:
+		handlerErr = h.handleAuth(v, peer)
+
+	default:
+		handlerErr = fmt.Errorf("ERR unknown command")
+	}
+
+	if handlerErr != nil {
+
+		if !errors.Is(handlerErr, ErrResponseSent) {
+			writer := resp.NewWriter(peer.conn)
+			if writeErr := writer.WriteError(handlerErr); writeErr != nil {
+				slog.Error("Failed to write error response", "err", writeErr)
+			}
+		}
+		return handlerErr
+	}
+	return nil
 }
 func (h *CommandHandler) handleHelp(cmd HelpCommand, peer *Peer) error {
 	commands := []string{
@@ -271,10 +304,16 @@ func (h *CommandHandler) handleQuit(peer *Peer) error {
 func (h *CommandHandler) handleAuth(cmd AuthCommand, peer *Peer) error {
 	token, err := h.authManager.Authenticate(cmd.username, cmd.password)
 	if err != nil {
-		return err
+
+		writer := resp.NewWriter(peer.conn)
+		if writeErr := writer.WriteError(fmt.Errorf("ERR invalid credentials")); writeErr != nil {
+			return fmt.Errorf("failed to send auth error: %w", writeErr)
+		}
+		return fmt.Errorf("authentication failed: %w", err)
 	}
 	peer.sessionToken = token
-	return resp.NewWriter(peer.conn).WriteString("OK")
+	writer := resp.NewWriter(peer.conn)
+	return writer.WriteString("OK")
 }
 func (h *CommandHandler) handleSet(cmd SetCommand, peer *Peer) error {
 
@@ -427,12 +466,13 @@ func (h *CommandHandler) handleHSet(cmd HSetCommand, peer *Peer) error {
 	val, exists := h.kv.data[key]
 	if !exists || val.Type != "hash" {
 		val = &KeyValue{
-			Type: "hash",
-			Hash: make(map[string]*HashField),
+			Type:      "hash",
+			Hash:      make(map[string]*HashField),
+			CreatedAt: time.Now(),
+			UpdatedAt: time.Now(),
 		}
 		h.kv.data[key] = val
 	}
-
 	val.Hash[string(cmd.field)] = &HashField{
 		Value: cmd.value,
 	}

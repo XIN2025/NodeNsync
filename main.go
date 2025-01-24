@@ -6,6 +6,7 @@ import (
 	"log"
 	"log/slog"
 	"net"
+	"os"
 
 	"github.com/tidwall/resp"
 )
@@ -28,6 +29,7 @@ type Server struct {
 	delPeerCh          chan *Peer
 	replicationManager *ReplicationManager
 	quitCh             chan struct{}
+	rateLimiter        *RateLimiter
 	msgCh              chan Message
 	kv                 *KVStore
 	commandHandler     *CommandHandler
@@ -51,6 +53,7 @@ func NewServer(cfg *ServerConfig) *Server {
 		metrics:            metrics,
 		replicationManager: replicationManager,
 		peers:              make(map[*Peer]bool),
+		rateLimiter:        NewRateLimiter(cfg),
 		addPeerCh:          make(chan *Peer),
 		delPeerCh:          make(chan *Peer),
 		quitCh:             make(chan struct{}),
@@ -74,6 +77,21 @@ func NewServer(cfg *ServerConfig) *Server {
 
 func (s *Server) Start() error {
 
+	if s.Config.RateLimit < 0 {
+		return fmt.Errorf("invalid rate limit value")
+	}
+
+	if s.Config.DataDir == "" {
+		return fmt.Errorf("data directory must be specified")
+	}
+
+	// Explicit directory verification
+	if _, err := os.Stat(s.Config.DataDir); os.IsNotExist(err) {
+		slog.Info("Creating data directory", "path", s.Config.DataDir)
+		if err := os.MkdirAll(s.Config.DataDir, 0755); err != nil {
+			return fmt.Errorf("failed to create data dir: %w", err)
+		}
+	}
 	if s.Config.SnapshotInterval <= 0 || s.Config.CleanupInterval <= 0 {
 		return fmt.Errorf("SnapshotInterval and CleanupInterval must be positive")
 	}
