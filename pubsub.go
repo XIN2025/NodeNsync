@@ -80,7 +80,6 @@ func (ps *PubSubManager) Subscribe(peer *Peer, channels ...string) error {
 		ps.subscriberCount[peer]++
 	}
 
-	// Enter subscribed mode
 	peer.EnterSubscribedMode()
 
 	writer := resp.NewWriter(peer.conn)
@@ -106,7 +105,7 @@ func (ps *PubSubManager) Unsubscribe(peer *Peer, channels ...string) (int, error
 	defer ps.mu.Unlock()
 
 	if len(channels) == 0 {
-		// Unsubscribe from all channels
+
 		for channel, subscribers := range ps.channels {
 			if subscribers[peer] {
 				delete(subscribers, peer)
@@ -117,7 +116,7 @@ func (ps *PubSubManager) Unsubscribe(peer *Peer, channels ...string) (int, error
 			}
 		}
 	} else {
-		// Unsubscribe from specific channels
+
 		for _, channel := range channels {
 			if subscribers := ps.channels[channel]; subscribers != nil {
 				if subscribers[peer] {
@@ -131,10 +130,9 @@ func (ps *PubSubManager) Unsubscribe(peer *Peer, channels ...string) (int, error
 		}
 	}
 
-	// If the peer has no more subscriptions, remove it from the subscriber count
 	if ps.subscriberCount[peer] == 0 {
 		delete(ps.subscriberCount, peer)
-		// Exit subscribed mode
+
 		peer.ExitSubscribedMode()
 	}
 

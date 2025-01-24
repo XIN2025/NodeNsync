@@ -19,9 +19,20 @@ type CommandHandler struct {
 	pubsub             *PubSubManager
 	replicationManager *ReplicationManager
 	startTime          time.Time
+	server             *Server
 }
 
-func NewCommandHandler(config *ServerConfig, authManager *AuthManager, clusterManager *ClusterManager, kv *KVStore, metrics *Metrics, monitor *Monitor, pubsub *PubSubManager, replicationManager *ReplicationManager) *CommandHandler {
+func NewCommandHandler(
+	config *ServerConfig,
+	authManager *AuthManager,
+	clusterManager *ClusterManager,
+	kv *KVStore,
+	metrics *Metrics,
+	monitor *Monitor,
+	pubsub *PubSubManager,
+	replicationManager *ReplicationManager,
+	server *Server,
+) *CommandHandler {
 	return &CommandHandler{
 		authManager:        authManager,
 		clusterManager:     clusterManager,
@@ -30,12 +41,43 @@ func NewCommandHandler(config *ServerConfig, authManager *AuthManager, clusterMa
 		monitor:            monitor,
 		pubsub:             pubsub,
 		replicationManager: replicationManager,
-		startTime:          time.Now(),
+		server:             server,
 	}
 }
 
-func (h *CommandHandler) HandleCommand(cmd Command, peer *Peer) error {
+func (h *CommandHandler) handleReplicaOf(cmd *ReplicaOfCommand, peer *Peer) error {
+	masterAddr := fmt.Sprintf("%s:%s", cmd.host, cmd.port)
+	slog.Info("Initiating replication", "master", masterAddr)
 
+	writer := resp.NewWriter(peer.conn)
+	if err := writer.WriteString("OK"); err != nil {
+		return err
+	}
+
+	go func() {
+		if h.replicationManager == nil {
+
+			h.replicationManager = NewReplicationManager(
+				h.server.Config,
+				h.kv,
+				h.metrics,
+			)
+		} else {
+
+			h.replicationManager.mu.Lock()
+			h.replicationManager.role = RoleReplica
+			h.replicationManager.mu.Unlock()
+		}
+
+		err := h.replicationManager.StartReplication(masterAddr)
+		if err != nil {
+			slog.Error("Replication failed", "error", err)
+		}
+	}()
+
+	return nil
+}
+func (h *CommandHandler) HandleCommand(cmd Command, peer *Peer) error {
 	slog.Info("Handling command", "command", fmt.Sprintf("%T", cmd))
 
 	if h.monitor != nil {
@@ -45,9 +87,13 @@ func (h *CommandHandler) HandleCommand(cmd Command, peer *Peer) error {
 
 	switch v := cmd.(type) {
 
+	case ReplAckCommand:
+		slog.Debug("Received REPLACK from replica", "peer", peer.conn.RemoteAddr())
+		return nil
 	case ReplicaOfCommand:
-		slog.Info("Handling REPLICAOF command", "host", v.host, "port", v.port)
-		return h.handleReplicaOf(v, peer)
+		return h.handleReplicaOf(&v, peer)
+	case SyncCommand:
+		return h.handleSync(peer)
 	case PingCommand:
 		return h.handlePing(peer)
 	case QuitCommand:
@@ -78,10 +124,7 @@ func (h *CommandHandler) HandleCommand(cmd Command, peer *Peer) error {
 		return h.handleInfo(peer)
 	case RoleCommand:
 		return h.handleRole(peer)
-	case SyncCommand:
-		return h.handleSync(peer)
 	case HelpCommand:
-
 		return h.handleHelp(v, peer)
 	case CommandCommand:
 		return h.handleCommand(peer)
@@ -92,6 +135,7 @@ func (h *CommandHandler) HandleCommand(cmd Command, peer *Peer) error {
 		return fmt.Errorf("ERR unknown command")
 	}
 }
+
 func formatCommand(cmd Command) string {
 	switch v := cmd.(type) {
 	case AuthCommand:
@@ -131,52 +175,45 @@ func formatCommand(cmd Command) string {
 	}
 }
 
-func (h *CommandHandler) handleReplicaOf(cmd ReplicaOfCommand, peer *Peer) error {
-	slog.Info("Handling REPLICAOF command", "host", cmd.host, "port", cmd.port)
+func (h *CommandHandler) HandleReplHandshake(cmd ReplHandshakeCommand, peer *Peer) error {
+	slog.Info("Received replication handshake", "addr", cmd.addr)
 
-	if err := h.requireAuth(peer); err != nil {
-		slog.Error("Authentication required", "err", err)
-		return err
-	}
-
-	masterAddr := fmt.Sprintf("%s:%s", cmd.host, cmd.port)
-	slog.Info("Setting as replica of master", "masterAddr", masterAddr)
-
-	err := h.replicationManager.SetAsReplica(masterAddr)
-	if err != nil {
-		slog.Error("Failed to set as replica", "err", err)
-		return fmt.Errorf("ERR failed to set as replica: %v", err)
-	}
-
-	slog.Info("Successfully set as replica", "masterAddr", masterAddr)
-
-	if err := resp.NewWriter(peer.conn).WriteString("OK"); err != nil {
-		return fmt.Errorf("ERR failed to write response: %v", err)
+	writer := resp.NewWriter(peer.conn)
+	if err := writer.WriteString(ReplAck); err != nil {
+		return fmt.Errorf("failed to send handshake acknowledgment: %w", err)
 	}
 
 	return nil
 }
 
 func (h *CommandHandler) handleSync(peer *Peer) error {
-	slog.Info("Handling SYNC command")
+	slog.Info("Starting sync process")
 
-	// Send all key-value data to the replica
 	h.kv.mu.RLock()
 	defer h.kv.mu.RUnlock()
 
 	writer := resp.NewWriter(peer.conn)
+
 	for key, value := range h.kv.data {
-		if err := writer.WriteArray([]resp.Value{
-			resp.StringValue("SET"),
+		err := writer.WriteArray([]resp.Value{
+			resp.StringValue(ReplData),
 			resp.StringValue(key),
 			resp.BytesValue(value.Value),
-		}); err != nil {
-			slog.Error("Failed to send key-value data", "err", err)
-			return err
+		})
+		if err != nil {
+			return fmt.Errorf("failed to send data: %w", err)
 		}
+		slog.Info("Sent key during sync", "key", key)
 	}
 
-	slog.Info("Finished sending key-value data to replica")
+	err := writer.WriteArray([]resp.Value{
+		resp.StringValue(ReplEnd),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to send sync end: %w", err)
+	}
+
+	slog.Info("Sync completed")
 	return nil
 }
 
@@ -239,16 +276,20 @@ func (h *CommandHandler) handleAuth(cmd AuthCommand, peer *Peer) error {
 	peer.sessionToken = token
 	return resp.NewWriter(peer.conn).WriteString("OK")
 }
-
 func (h *CommandHandler) handleSet(cmd SetCommand, peer *Peer) error {
-	if err := h.requireAuth(peer); err != nil {
-		return err
-	}
+
 	h.kv.mu.Lock()
-	defer h.kv.mu.Unlock()
-	h.kv.data[string(cmd.key)] = &KeyValue{
-		Value: cmd.value,
+	h.kv.data[string(cmd.key)] = &KeyValue{Value: cmd.value}
+	h.kv.mu.Unlock()
+
+	if h.replicationManager != nil {
+		h.replicationManager.BroadcastToReplicas(ReplicationCommand{
+			Operation: "SET",
+			Key:       string(cmd.key),
+			Value:     cmd.value,
+		})
 	}
+
 	return resp.NewWriter(peer.conn).WriteString("OK")
 }
 
@@ -256,12 +297,15 @@ func (h *CommandHandler) handleGet(cmd GetCommand, peer *Peer) error {
 	if err := h.requireAuth(peer); err != nil {
 		return err
 	}
+
 	h.kv.mu.RLock()
 	defer h.kv.mu.RUnlock()
+
 	val, exists := h.kv.data[string(cmd.key)]
 	if !exists {
 		return resp.NewWriter(peer.conn).WriteNull()
 	}
+
 	return resp.NewWriter(peer.conn).WriteString(string(val.Value))
 }
 

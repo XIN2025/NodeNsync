@@ -1,6 +1,11 @@
 package main
 
+import "github.com/tidwall/resp"
+
 type CommandType string
+
+type Command interface {
+}
 
 const (
 	CmdPing      CommandType = "PING"
@@ -24,18 +29,28 @@ const (
 
 type PingCommand struct{}
 
-type QuitCommand struct{}
-type UnsubscribeCommand struct {
-	channels []string
-}
-type AuthCommand struct {
-	username string
-	password string
+type ReplAckCommand struct{}
+type ReplHandshakeCommand struct {
+	addr string
 }
 
 type SetCommand struct {
 	key   []byte
 	value []byte
+}
+
+type QuitCommand struct{}
+type UnsubscribeCommand struct {
+	channels []string
+}
+
+type ReplDataCommand struct {
+	Args []resp.Value
+}
+
+type AuthCommand struct {
+	username string
+	password string
 }
 
 type ReplicaOfCommand struct {
@@ -66,8 +81,6 @@ type HGetCommand struct {
 	key   []byte
 	field []byte
 }
-
-type Command interface{}
 
 type PublishCommand struct {
 	channel string

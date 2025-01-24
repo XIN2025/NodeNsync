@@ -6,9 +6,9 @@ import (
 	"log"
 	"log/slog"
 	"net"
-)
 
-const defaultListenAddr = ":6379"
+	"github.com/tidwall/resp"
+)
 
 type Config struct {
 	ListenAddr string
@@ -20,52 +20,69 @@ type Message struct {
 }
 
 type Server struct {
-	ServerConfig
-	peers          map[*Peer]bool
-	ln             net.Listener
-	addPeerCh      chan *Peer
-	delPeerCh      chan *Peer
-	quitCh         chan struct{}
-	msgCh          chan Message
-	kv             *KVStore
-	commandHandler *CommandHandler
+	Config             *ServerConfig
+	metrics            *Metrics
+	peers              map[*Peer]bool
+	ln                 net.Listener
+	addPeerCh          chan *Peer
+	delPeerCh          chan *Peer
+	replicationManager *ReplicationManager
+	quitCh             chan struct{}
+	msgCh              chan Message
+	kv                 *KVStore
+	commandHandler     *CommandHandler
 }
 
 func NewServer(cfg *ServerConfig) *Server {
 	metrics := NewMetrics()
-	replicationManager := NewReplicationManager(cfg, nil, metrics) // Create ReplicationManager
-	kv := NewKVStore(cfg, metrics, replicationManager)             // Pass ReplicationManager to KVStore
+	kv := NewKVStore(cfg, metrics, nil)
+
 	authManager := NewAuthManager()
 	clusterManager := NewClusterManager()
 	monitor := NewMonitor()
 	pubsub := NewPubSubManager(cfg, metrics)
-	replicationManager.kv = kv // Set the KVStore in the ReplicationManager
+	replicationManager := NewReplicationManager(cfg, kv, metrics)
 
-	commandHandler := NewCommandHandler(cfg, authManager, clusterManager, kv, metrics, monitor, pubsub, replicationManager)
+	kv.replicationManager = replicationManager
 
-	return &Server{
-		ServerConfig:   *cfg,
-		peers:          make(map[*Peer]bool),
-		addPeerCh:      make(chan *Peer),
-		delPeerCh:      make(chan *Peer),
-		quitCh:         make(chan struct{}),
-		msgCh:          make(chan Message),
-		kv:             kv,
-		commandHandler: commandHandler,
+	server := &Server{
+		Config:             cfg,
+		kv:                 kv,
+		metrics:            metrics,
+		replicationManager: replicationManager,
+		peers:              make(map[*Peer]bool),
+		addPeerCh:          make(chan *Peer),
+		delPeerCh:          make(chan *Peer),
+		quitCh:             make(chan struct{}),
+		msgCh:              make(chan Message),
 	}
+
+	server.commandHandler = NewCommandHandler(
+		cfg,
+		authManager,
+		clusterManager,
+		kv,
+		metrics,
+		monitor,
+		pubsub,
+		replicationManager,
+		server,
+	)
+
+	return server
 }
 
 func (s *Server) Start() error {
 
-	if s.SnapshotInterval <= 0 || s.CleanupInterval <= 0 {
+	if s.Config.SnapshotInterval <= 0 || s.Config.CleanupInterval <= 0 {
 		return fmt.Errorf("SnapshotInterval and CleanupInterval must be positive")
 	}
 
 	slog.Info("Starting server with config",
-		"SnapshotInterval", s.SnapshotInterval,
-		"CleanupInterval", s.CleanupInterval)
+		"SnapshotInterval", s.Config.SnapshotInterval,
+		"CleanupInterval", s.Config.CleanupInterval)
 
-	ln, err := net.Listen("tcp", s.ListenAddr)
+	ln, err := net.Listen("tcp", s.Config.ListenAddr)
 	if err != nil {
 		return err
 	}
@@ -73,20 +90,39 @@ func (s *Server) Start() error {
 
 	go s.loop()
 
-	slog.Info("goredis server running", "listenAddr", s.ListenAddr)
+	slog.Info("goredis server running", "listenAddr", s.Config.ListenAddr)
 
 	return s.acceptLoop()
 }
 
-func (s *Server) getPrompt(peer *Peer) string {
-	if peer.inSubscribedMode {
-		return fmt.Sprintf("%s(subscribed mode)> ", s.ListenAddr)
-	}
-	return fmt.Sprintf("%s> ", s.ListenAddr)
+func (c SyncCommand) Name() string {
+	return "SYNC"
 }
 
 func (s *Server) handleMessage(msg Message) error {
 	switch v := msg.cmd.(type) {
+	case SyncCommand:
+		if s.replicationManager == nil {
+			writer := resp.NewWriter(msg.peer.conn)
+			return writer.WriteError(fmt.Errorf("replication not enabled"))
+		}
+		return s.replicationManager.handleSyncCommand(msg.peer)
+
+	case ReplHandshakeCommand:
+		if s.replicationManager == nil {
+			return fmt.Errorf("replication not enabled")
+		}
+		return s.commandHandler.HandleReplHandshake(v, msg.peer)
+
+	case ReplDataCommand:
+		if s.replicationManager == nil {
+			return fmt.Errorf("replication not enabled")
+		}
+		return s.replicationManager.HandleReplData(v.Args)
+
+	case ReplAckCommand:
+
+		return nil
 	case PingCommand:
 		return s.commandHandler.HandleCommand(v, msg.peer)
 	case QuitCommand:
@@ -111,6 +147,7 @@ func (s *Server) handleMessage(msg Message) error {
 		return s.commandHandler.HandleCommand(v, msg.peer)
 	case UnsubscribeCommand:
 		return s.commandHandler.HandleCommand(v, msg.peer)
+
 	case MonitorCommand:
 
 		go func() {
@@ -121,9 +158,10 @@ func (s *Server) handleMessage(msg Message) error {
 		return nil
 
 	case ReplicaOfCommand:
-		err := s.commandHandler.HandleCommand(msg.cmd, msg.peer)
+		slog.Info("Handling REPLICAOF command", "host", v.host, "port", v.port)
+		err := s.commandHandler.HandleCommand(v, msg.peer)
 		if err != nil {
-			slog.Error("Command handling error", "err", err, "command", fmt.Sprintf("%T", msg.cmd))
+			slog.Error("Failed to handle REPLICAOF command", "err", err)
 			return err
 		}
 		return nil
@@ -137,18 +175,25 @@ func (s *Server) handleMessage(msg Message) error {
 		return s.commandHandler.HandleCommand(v, msg.peer)
 	case HelloCommand:
 		return s.commandHandler.HandleCommand(v, msg.peer)
-	case SyncCommand:
-		return s.commandHandler.handleCommand(msg.peer)
+
 	default:
-		return fmt.Errorf("ERR unknown command")
+		if msg.cmd == nil {
+
+			slog.Debug("Ignoring unexpected <nil> command from replica", "peer", msg.peer.conn.RemoteAddr())
+		} else {
+
+			slog.Warn("Received unexpected command from replica", "command", msg.cmd)
+		}
+		return nil
 	}
 }
+
 func (s *Server) loop() {
 	for {
 		select {
 		case msg := <-s.msgCh:
 			if err := s.handleMessage(msg); err != nil {
-				slog.Error("raw message eror", "err", err)
+				slog.Error("raw message error", "err", err)
 			}
 		case <-s.quitCh:
 			return
@@ -175,6 +220,7 @@ func (s *Server) acceptLoop() error {
 
 func (s *Server) handleConn(conn net.Conn) {
 	peer := NewPeer(conn, s.msgCh, s.delPeerCh)
+	peer.server = s
 	s.addPeerCh <- peer
 	if err := peer.readLoop(); err != nil {
 		slog.Error("peer read error", "err", err, "remoteAddr", conn.RemoteAddr())

@@ -1,37 +1,48 @@
 package main
 
 import (
-	"bytes"
-	"encoding/gob"
 	"fmt"
 	"log/slog"
 	"net"
 	"sync"
-	"sync/atomic"
 	"time"
+
+	"github.com/tidwall/resp"
 )
 
 type ReplicationRole string
 
 const (
-	RoleMaster  ReplicationRole = "master"
-	RoleReplica ReplicationRole = "replica"
+	ReplHandshake                 = "REPLHANDSHAKE"
+	ReplAck                       = "REPLACK"
+	ReplSync                      = "SYNC"
+	ReplData                      = "REPLDATA"
+	ReplEnd                       = "REPLEND"
+	RoleMaster    ReplicationRole = "master"
+	RoleReplica   ReplicationRole = "replica"
 )
 
 type ReplicationManager struct {
 	mu sync.RWMutex
 
-	role ReplicationRole
-	kv   *KVStore
+	role      ReplicationRole
+	kv        *KVStore
+	replicaKV *KVStore
 
-	replicas map[string]*ReplicaInfo
+	replicas     map[string]*ReplicaInfo
+	replicaConns map[string]net.Conn
 
 	masterAddr string
 	masterConn net.Conn
-	offset     uint64
 
-	config  *ServerConfig
-	metrics *Metrics
+	config       *ServerConfig
+	metrics      *Metrics
+	retryBackoff time.Duration
+	maxBackoff   time.Duration
+	activeConn   net.Conn
+	syncComplete bool
+	stopChan     chan struct{}
+	activeSync   map[string]bool
 }
 
 type ReplicaInfo struct {
@@ -49,205 +60,475 @@ type ReplicationCommand struct {
 }
 
 func NewReplicationManager(config *ServerConfig, kv *KVStore, metrics *Metrics) *ReplicationManager {
-	rm := &ReplicationManager{
-		role:     RoleMaster,
-		kv:       kv,
-		replicas: make(map[string]*ReplicaInfo),
-		config:   config,
-		metrics:  metrics,
+	return &ReplicationManager{
+		kv:           kv,
+		replicas:     make(map[string]*ReplicaInfo),
+		replicaConns: make(map[string]net.Conn),
+		activeSync:   make(map[string]bool),
+		config:       config,
+		metrics:      metrics,
+		stopChan:     make(chan struct{}),
 	}
-	go rm.healthCheckLoop()
-	return rm
 }
-
-func (rm *ReplicationManager) SetAsMaster() error {
+func (rm *ReplicationManager) StartReplication(masterAddr string) error {
 	rm.mu.Lock()
-	defer rm.mu.Unlock()
-
-	rm.role = RoleMaster
-	if rm.masterConn != nil {
-		rm.masterConn.Close()
-		rm.masterConn = nil
-	}
-	return nil
-}
-
-func (rm *ReplicationManager) connectToMaster() error {
-
-	if rm.masterConn != nil {
-		rm.masterConn.Close()
-		rm.masterConn = nil
-	}
-
-	conn, err := net.Dial("tcp", rm.masterAddr)
-	if err != nil {
-		return fmt.Errorf("failed to connect to master: %w", err)
-	}
-
-	rm.masterConn = conn
-
-	go rm.replicationLoop()
-
-	return nil
-}
-
-func (rm *ReplicationManager) SetAsReplica(masterAddr string) error {
-	rm.mu.Lock()
-	defer rm.mu.Unlock()
-
-	rm.role = RoleReplica
 	rm.masterAddr = masterAddr
+	rm.role = RoleReplica
+	rm.syncComplete = false
+	rm.mu.Unlock()
 
-	slog.Info("Connecting to master", "masterAddr", masterAddr)
-	err := rm.connectToMaster()
-	if err != nil {
-		slog.Error("Failed to connect to master", "err", err)
+	if err := rm.connectAndSync(); err != nil {
+		slog.Error("Initial sync failed", "error", err)
 		return err
 	}
 
-	slog.Info("Successfully connected to master", "masterAddr", masterAddr)
+	go rm.replicationLoop()
 	return nil
 }
 
-func (rm *ReplicationManager) handleHeartbeat() {
-	buf := make([]byte, 4)
+func (rm *ReplicationManager) replicationLoop() {
+	retryDelay := time.Second
 	for {
-		_, err := rm.masterConn.Read(buf)
-		if err != nil {
-			slog.Error("Failed to read heartbeat from master", "err", err)
+		select {
+		case <-rm.stopChan:
 			return
-		}
-
-		if string(buf) == "PING" {
-			slog.Info("Received heartbeat from master")
-		}
-	}
-}
-
-func (rm *ReplicationManager) heartbeatLoop() {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		rm.mu.RLock()
-		for addr, replica := range rm.replicas {
-			if !replica.IsHealthy {
+		default:
+			if err := rm.connectAndSync(); err != nil {
+				slog.Error("Replication error", "error", err)
+				time.Sleep(retryDelay)
+				retryDelay = min(retryDelay*2, 30*time.Second)
 				continue
 			}
-
-			go func(addr string) {
-				conn, err := net.Dial("tcp", addr)
-				if err != nil {
-					slog.Error("Failed to send heartbeat to replica", "addr", addr, "err", err)
-					return
-				}
-				defer conn.Close()
-
-				_, err = conn.Write([]byte("PING"))
-				if err != nil {
-					slog.Error("Failed to send heartbeat to replica", "addr", addr, "err", err)
-					return
-				}
-
-				slog.Info("Sent heartbeat to replica", "addr", addr)
-			}(addr)
+			retryDelay = time.Second
 		}
-		rm.mu.RUnlock()
 	}
 }
 
-func (rm *ReplicationManager) replicationLoop() {
+func (rm *ReplicationManager) handleMasterConnection(conn net.Conn) error {
 
-	slog.Info("Starting replication loop")
+	writer := resp.NewWriter(conn)
+	if err := writer.WriteArray([]resp.Value{
+		resp.StringValue("REPLHANDSHAKE"),
+		resp.StringValue(rm.config.ListenAddr),
+	}); err != nil {
+		conn.Close()
+		return err
+	}
+
+	reader := resp.NewReader(conn)
+	if _, _, err := reader.ReadValue(); err != nil {
+		conn.Close()
+		return fmt.Errorf("handshake failed: %w", err)
+	}
+
+	if err := writer.WriteArray([]resp.Value{resp.StringValue("SYNC")}); err != nil {
+		conn.Close()
+		return err
+	}
+
+	if err := rm.processSyncStream(conn); err != nil {
+		conn.Close()
+		return err
+	}
+
+	return nil
+}
+
+func (rm *ReplicationManager) processSyncStream(conn net.Conn) error {
+	reader := resp.NewReader(conn)
+
+	for {
+		val, _, err := reader.ReadValue()
+		if err != nil {
+			return err
+		}
+
+		arr := val.Array()
+		if len(arr) == 0 {
+			continue
+		}
+
+		switch arr[0].String() {
+		case "REPLDATA":
+			if len(arr) < 3 {
+				slog.Warn("Invalid REPLDATA command: insufficient arguments", "args", arr)
+				continue
+			}
+			if err := rm.HandleReplData(arr); err != nil {
+				slog.Error("Error processing REPLDATA", "err", err)
+			}
+		case "REPLEND":
+			slog.Info("Initial sync completed")
+			rm.mu.Lock()
+			rm.syncComplete = true
+			rm.mu.Unlock()
+
+			go rm.handlePersistentConnection(conn)
+			return nil
+		}
+	}
+}
+func (rm *ReplicationManager) handlePersistentConnection(conn net.Conn) error {
+	defer conn.Close()
+	reader := resp.NewReader(conn)
+	writer := resp.NewWriter(conn)
+
+	if err := writer.WriteString("READY"); err != nil {
+		return err
+	}
+
+	for {
+		val, _, err := reader.ReadValue()
+		if err != nil {
+			slog.Error("Replication stream error", "error", err)
+			return err
+		}
+
+		if arr := val.Array(); len(arr) > 0 {
+			switch arr[0].String() {
+			case "REPLDATA":
+				if len(arr) < 3 {
+					slog.Warn("Invalid REPLDATA format")
+					continue
+				}
+				rm.kv.ApplyReplicationCommand(ReplicationCommand{
+					Operation: "SET",
+					Key:       arr[1].String(),
+					Value:     arr[2].Bytes(),
+				})
+			}
+		}
+	}
+}
+
+func (rm *ReplicationManager) HandleSyncRequest(peer *Peer) error {
+	rm.kv.mu.RLock()
+	defer rm.kv.mu.RUnlock()
+
+	writer := resp.NewWriter(peer.conn)
+
+	for key, value := range rm.kv.data {
+		if err := writer.WriteArray([]resp.Value{
+			resp.StringValue("REPLDATA"),
+			resp.StringValue(key),
+			resp.BytesValue(value.Value),
+		}); err != nil {
+			peer.conn.Close()
+			return err
+		}
+	}
+
+	if err := writer.WriteString("REPLEND"); err != nil {
+		peer.conn.Close()
+		return err
+	}
+
+	go rm.handleMasterConnectionPersistent(peer.conn)
+	return nil
+}
+
+func (rm *ReplicationManager) handleMasterConnectionPersistent(conn net.Conn) {
+
+	addr := conn.RemoteAddr().String()
+	rm.mu.Lock()
+	rm.replicas[addr] = &ReplicaInfo{
+		Addr:      addr,
+		LastSeen:  time.Now(),
+		IsHealthy: true,
+	}
+	rm.mu.Unlock()
+
+	tcpConn := conn.(*net.TCPConn)
+	tcpConn.SetKeepAlive(true)
+	tcpConn.SetKeepAlivePeriod(30 * time.Second)
+	conn.SetDeadline(time.Time{})
+
+	ticker := time.NewTicker(5 * time.Second)
 	defer func() {
-		if rm.masterConn != nil {
-			rm.masterConn.Close()
-			rm.masterConn = nil
+		ticker.Stop()
+		conn.Close()
+		rm.mu.Lock()
+		rm.replicas[addr].IsHealthy = false
+		rm.mu.Unlock()
+	}()
+
+	go func() {
+		writer := resp.NewWriter(conn)
+		for range ticker.C {
+			rm.mu.Lock()
+			rm.replicas[addr].LastSeen = time.Now()
+			rm.mu.Unlock()
+
+			if err := writer.WriteString("PING"); err != nil {
+				return
+			}
 		}
 	}()
 
-	decoder := gob.NewDecoder(rm.masterConn)
+	reader := resp.NewReader(conn)
+	for {
+		_, _, err := reader.ReadValue()
+		if err != nil {
+			break
+		}
+	}
+}
+
+func (rm *ReplicationManager) handleMasterUpdates(conn net.Conn) {
+	defer conn.Close()
+
+	rm.mu.Lock()
+	addr := conn.RemoteAddr().String()
+	rm.replicas[addr] = &ReplicaInfo{
+		Addr:      addr,
+		LastSeen:  time.Now(),
+		IsHealthy: true,
+	}
+	rm.replicas[addr].IsHealthy = true
+	rm.mu.Unlock()
+
+	reader := resp.NewReader(conn)
+	writer := resp.NewWriter(conn)
+
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	go func() {
+		for {
+			select {
+			case <-ticker.C:
+				rm.mu.Lock()
+				rm.replicas[addr].LastSeen = time.Now()
+				rm.mu.Unlock()
+
+				if err := writer.WriteString("PING"); err != nil {
+					return
+				}
+			}
+		}
+	}()
 
 	for {
-		var cmd ReplicationCommand
-		err := decoder.Decode(&cmd)
+		val, _, err := reader.ReadValue()
 		if err != nil {
-			slog.Error("Replication error", "err", err)
-			time.Sleep(time.Second)
-			if err := rm.connectToMaster(); err != nil {
-				slog.Error("Failed to reconnect to master", "err", err)
-			}
+			rm.mu.Lock()
+			rm.replicas[addr].IsHealthy = false
+			rm.mu.Unlock()
 			return
 		}
 
-		slog.Info("Received replication command from master", "cmd", cmd)
-		if err := rm.applyCommand(cmd); err != nil {
-			slog.Error("Failed to apply replicated command", "err", err)
-			continue
-		}
-
-		atomic.AddUint64(&rm.offset, 1)
-		if rm.metrics != nil {
-			atomic.StoreUint64(&rm.metrics.ReplicationOffset, rm.offset)
+		if val.String() == "PONG" {
+			rm.mu.Lock()
+			rm.replicas[addr].LastSeen = time.Now()
+			rm.mu.Unlock()
 		}
 	}
 }
-func (rm *ReplicationManager) applyCommand(cmd ReplicationCommand) error {
-	slog.Info("Applying replication command", "cmd", cmd)
-	switch cmd.Operation {
-	case "SET":
-		slog.Info("Applying SET command", "key", cmd.Key, "value", cmd.Value)
-		return rm.kv.Set(cmd.Key, cmd.Value, cmd.TTL)
-	case "DEL":
-		slog.Info("Applying DEL command", "key", cmd.Key)
-		rm.kv.Delete(cmd.Key)
-		return nil
-	default:
-		slog.Error("Unknown replication command", "operation", cmd.Operation)
-		return nil
+
+func (rm *ReplicationManager) handleContinuousUpdates(conn net.Conn) {
+	defer conn.Close()
+	reader := resp.NewReader(conn)
+	writer := resp.NewWriter(conn)
+
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	go func() {
+		for range ticker.C {
+			if err := writer.WriteString("PONG"); err != nil {
+				return
+			}
+		}
+	}()
+
+	for {
+		val, _, err := reader.ReadValue()
+		if err != nil {
+			slog.Error("Update stream broken", "error", err)
+			rm.mu.Lock()
+			rm.syncComplete = false
+			rm.mu.Unlock()
+			return
+		}
+
+		switch val.String() {
+		case "PING":
+			writer.WriteString("PONG")
+		default:
+			arr := val.Array()
+			if len(arr) > 0 && arr[0].String() == "REPLDATA" {
+				rm.kv.ApplyReplicationCommand(ReplicationCommand{
+					Operation: "SET",
+					Key:       arr[1].String(),
+					Value:     arr[2].Bytes(),
+				})
+			}
+		}
 	}
 }
 
+func (rm *ReplicationManager) Stop() {
+	close(rm.stopChan)
+	if rm.activeConn != nil {
+		rm.activeConn.Close()
+	}
+}
+
+func min(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func (rm *ReplicationManager) HandleReplData(args []resp.Value) error {
+	if len(args) < 3 {
+		return fmt.Errorf("invalid REPLDATA: expected at least 3 arguments, got %d", len(args))
+	}
+
+	key := args[1].String()
+	value := args[2].Bytes()
+
+	rm.kv.mu.Lock()
+	defer rm.kv.mu.Unlock()
+
+	rm.kv.data[key] = &KeyValue{
+		Value:     value,
+		Type:      "string",
+		UpdatedAt: time.Now(),
+	}
+
+	slog.Info("Processed replication data", "key", key, "value", string(value))
+	return nil
+}
+
+func (rm *ReplicationManager) HandleReplHandshake(peer *Peer) error {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+
+	writer := resp.NewWriter(peer.conn)
+	if err := writer.WriteString(ReplAck); err != nil {
+		return fmt.Errorf("handshake ACK failed: %w", err)
+	}
+
+	slog.Info("Handshake completed", "replica", peer.conn.RemoteAddr().String())
+	rm.replicas[peer.conn.RemoteAddr().String()] = &ReplicaInfo{
+		Addr:      peer.conn.RemoteAddr().String(),
+		LastSeen:  time.Now(),
+		IsHealthy: true,
+	}
+	return nil
+}
+
+func (rm *ReplicationManager) handleSyncCommand(peer *Peer) error {
+	slog.Info("Starting sync process with replica", "replicaAddr", peer.conn.RemoteAddr())
+
+	rm.kv.mu.RLock()
+	defer rm.kv.mu.RUnlock()
+
+	writer := resp.NewWriter(peer.conn)
+	for key, value := range rm.kv.data {
+		err := writer.WriteArray([]resp.Value{
+			resp.StringValue("REPLDATA"),
+			resp.StringValue(key),
+			resp.BytesValue(value.Value),
+		})
+		if err != nil {
+			return err
+		}
+	}
+
+	if err := writer.WriteArray([]resp.Value{resp.StringValue("REPLEND")}); err != nil {
+		return err
+	}
+
+	go rm.handleMasterConnectionPersistent(peer.conn)
+	return nil
+}
+
+func (rm *ReplicationManager) connectAndSync() error {
+	rm.mu.Lock()
+	masterAddr := rm.masterAddr
+	rm.mu.Unlock()
+
+	conn, err := net.DialTimeout("tcp", masterAddr, 30*time.Second)
+	if err != nil {
+		return fmt.Errorf("connection failed: %w", err)
+	}
+	defer conn.Close()
+
+	writer := resp.NewWriter(conn)
+	if err := writer.WriteArray([]resp.Value{
+		resp.StringValue("REPLHANDSHAKE"),
+		resp.StringValue(rm.config.ListenAddr),
+	}); err != nil {
+		return fmt.Errorf("handshake failed: %w", err)
+	}
+
+	reader := resp.NewReader(conn)
+	if _, _, err := reader.ReadValue(); err != nil {
+		return fmt.Errorf("handshake response failed: %w", err)
+	}
+
+	rm.mu.RLock()
+	syncNeeded := !rm.syncComplete
+	rm.mu.RUnlock()
+
+	if syncNeeded {
+		if err := writer.WriteArray([]resp.Value{resp.StringValue("SYNC")}); err != nil {
+			return fmt.Errorf("SYNC command failed: %w", err)
+		}
+
+		if err := rm.processSyncStream(conn); err != nil {
+			return fmt.Errorf("sync failed: %w", err)
+		}
+
+		rm.mu.Lock()
+		rm.syncComplete = true
+		rm.mu.Unlock()
+	}
+
+	return rm.handlePersistentConnection(conn)
+}
+
+func (rm *ReplicationManager) continuousReplication(conn net.Conn) error {
+	rd := resp.NewReader(conn)
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+
+			writer := resp.NewWriter(conn)
+			if err := writer.WriteArray([]resp.Value{resp.StringValue("PING")}); err != nil {
+				return fmt.Errorf("heartbeat failed: %w", err)
+			}
+		default:
+			conn.SetReadDeadline(time.Time{})
+			_, _, err := rd.ReadValue()
+			if err != nil {
+				return fmt.Errorf("replication read failed: %w", err)
+			}
+
+		}
+	}
+}
 func (rm *ReplicationManager) BroadcastToReplicas(cmd ReplicationCommand) {
-
-	slog.Info("Broadcasting replication command", "cmd", cmd)
 	rm.mu.RLock()
 	defer rm.mu.RUnlock()
 
-	if rm.role != RoleMaster {
-		return
+	data := []resp.Value{
+		resp.StringValue(ReplData),
+		resp.StringValue(cmd.Key),
+		resp.BytesValue(cmd.Value),
 	}
 
-	encoded := &bytes.Buffer{}
-	encoder := gob.NewEncoder(encoded)
-	if err := encoder.Encode(cmd); err != nil {
-		slog.Error("Failed to encode replication command", "err", err)
-		return
-	}
-
-	slog.Info("Encoded replication command", "cmd", cmd, "encoded", encoded.Bytes())
-
-	for addr, replica := range rm.replicas {
-		if !replica.IsHealthy {
-			continue
+	for addr, conn := range rm.replicaConns {
+		writer := resp.NewWriter(conn)
+		if err := writer.WriteArray(data); err != nil {
+			slog.Error("Broadcast failed", "replica", addr, "err", err)
 		}
-
-		go func(addr string, data []byte) {
-			conn, err := net.Dial("tcp", addr)
-			if err != nil {
-				slog.Error("Failed to connect to replica", "addr", addr, "err", err)
-				return
-			}
-			defer conn.Close()
-
-			_, err = conn.Write(data)
-			if err != nil {
-				slog.Error("Failed to send replication command to replica", "addr", addr, "err", err)
-				return
-			}
-
-			slog.Info("Successfully sent replication command to replica", "addr", addr, "cmd", cmd)
-		}(addr, encoded.Bytes())
 	}
 }
 
@@ -259,18 +540,71 @@ func (rm *ReplicationManager) healthCheckLoop() {
 		rm.mu.Lock()
 		now := time.Now()
 
-		for _, replica := range rm.replicas {
-			wasHealthy := replica.IsHealthy
-			replica.IsHealthy = now.Sub(replica.LastSeen) < rm.config.ConnectionTimeout
-
-			if wasHealthy != replica.IsHealthy {
-				if replica.IsHealthy {
-					atomic.AddUint64(&rm.metrics.ReplicaCount, 1)
-				} else {
-					atomic.AddUint64(&rm.metrics.ReplicaCount, ^uint64(0))
+		for addr, replica := range rm.replicas {
+			if now.Sub(replica.LastSeen) > rm.config.ConnectionTimeout {
+				slog.Warn("Replica timeout", "addr", addr)
+				replica.IsHealthy = false
+				if conn, exists := rm.replicaConns[addr]; exists {
+					conn.Close()
+					delete(rm.replicaConns, addr)
 				}
 			}
 		}
 		rm.mu.Unlock()
+	}
+}
+
+func (rm *ReplicationManager) SetAsReplica(masterAddr string) error {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+
+	conn, err := net.DialTimeout("tcp", masterAddr, 5*time.Second)
+	if err != nil {
+		return fmt.Errorf("failed to connect to master: %w", err)
+	}
+	rm.masterAddr = masterAddr
+	rm.masterConn = conn
+
+	writer := resp.NewWriter(conn)
+	if err := writer.WriteArray([]resp.Value{resp.StringValue(ReplHandshake), resp.StringValue(":6380")}); err != nil {
+		return fmt.Errorf("failed to send handshake: %w", err)
+	}
+
+	go rm.receiveSyncData(conn)
+	return nil
+}
+func (rm *ReplicationManager) receiveSyncData(conn net.Conn) {
+	reader := resp.NewReader(conn)
+
+	for {
+		v, _, err := reader.ReadValue()
+		if err != nil {
+			slog.Error("Error reading sync data from master", "err", err)
+			return
+		}
+
+		args := v.Array()
+		if len(args) == 0 {
+			slog.Warn("Invalid sync data received: empty array")
+			continue
+		}
+
+		command := args[0].String()
+		switch command {
+		case ReplData:
+			if len(args) < 3 {
+				slog.Warn("Invalid REPLDATA command: insufficient arguments", "args", args)
+				continue
+			}
+			if err := rm.HandleReplData(args); err != nil {
+				slog.Error("Error processing REPLDATA", "err", err)
+			}
+		case ReplEnd:
+			slog.Info("Sync completed, switching to continuous replication")
+			conn.Close()
+			return
+		default:
+			slog.Warn("Unknown replication command received", "command", command, "args", args)
+		}
 	}
 }

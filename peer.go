@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"log"
 	"log/slog"
 	"net"
 	"strings"
@@ -31,8 +30,9 @@ type Peer struct {
 	ID               string
 	sessionToken     string
 	lastActivity     time.Time
-	monitorCh        chan string // Buffered channel for monitor messages
+	monitorCh        chan string
 	inSubscribedMode bool
+	server           *Server
 	mu               sync.Mutex
 }
 
@@ -41,7 +41,7 @@ func NewPeer(conn net.Conn, msgCh chan Message, delCh chan *Peer) *Peer {
 		conn:      conn,
 		msgCh:     msgCh,
 		delCh:     delCh,
-		monitorCh: make(chan string, 100), // Buffered channel to avoid blocking
+		monitorCh: make(chan string, 100),
 	}
 }
 
@@ -68,11 +68,12 @@ func (p *Peer) readLoop() error {
 	for {
 		v, _, err := rd.ReadValue()
 		if err == io.EOF {
+			slog.Info("Client disconnected", "remoteAddr", p.conn.RemoteAddr())
 			p.delCh <- p
 			break
 		}
 		if err != nil {
-			log.Printf("read error: %v", err)
+			slog.Error("Read error", "err", err)
 			return err
 		}
 
@@ -81,7 +82,13 @@ func (p *Peer) readLoop() error {
 			args := v.Array()[1:]
 			var cmd Command
 
+			slog.Info("Received command", "command", rawCMD, "args", args)
+
 			switch strings.ToUpper(rawCMD) {
+			// In peer.go's readLoop
+			case "REPLACK":
+				cmd = ReplAckCommand{}
+				// ... other cases ...
 			case "AUTH":
 				if len(args) < 2 {
 					writer := resp.NewWriter(p.conn)
@@ -183,7 +190,6 @@ func (p *Peer) readLoop() error {
 					}
 					continue
 				}
-
 				channel := args[0].String()
 				var messageParts []string
 				for _, arg := range args[1:] {
@@ -196,16 +202,27 @@ func (p *Peer) readLoop() error {
 				}
 			case "REPLICAOF":
 				if len(args) < 2 {
-					slog.Error("Invalid REPLICAOF command", "args", args)
-					return fmt.Errorf("ERR wrong number of arguments for 'REPLICAOF' command")
+					writer := resp.NewWriter(p.conn)
+					if err := writer.WriteError(fmt.Errorf("ERR wrong number of arguments for 'REPLICAOF' command")); err != nil {
+						return err
+					}
+					continue
 				}
-				cmd := ReplicaOfCommand{
+				cmd = ReplicaOfCommand{
 					host: args[0].String(),
 					port: args[1].String(),
 				}
-				slog.Info("Parsed REPLICAOF command", "host", cmd.host, "port", cmd.port)
-				slog.Info("Sending REPLICAOF command to handler", "cmd", cmd)
-				p.msgCh <- Message{cmd: cmd, peer: p}
+			case "REPLHANDSHAKE":
+				if len(args) < 1 {
+					writer := resp.NewWriter(p.conn)
+					if err := writer.WriteError(fmt.Errorf("ERR wrong number of arguments for 'REPLHANDSHAKE' command")); err != nil {
+						return err
+					}
+					continue
+				}
+				cmd = ReplHandshakeCommand{
+					addr: args[0].String(),
+				}
 			case "SUBSCRIBE":
 				if len(args) < 1 {
 					writer := resp.NewWriter(p.conn)
@@ -222,6 +239,7 @@ func (p *Peer) readLoop() error {
 				cmd = UnsubscribeCommand{
 					channels: channels,
 				}
+
 			case "MONITOR":
 				cmd = MonitorCommand{}
 			case "INFO":
@@ -235,8 +253,11 @@ func (p *Peer) readLoop() error {
 			case "HELLO":
 				cmd = HelloCommand{}
 			case "SYNC":
-				cmd = SyncCommand{}
-
+				slog.Info("Received SYNC command")
+				p.msgCh <- Message{
+					cmd:  SyncCommand{},
+					peer: p,
+				}
 			default:
 				slog.Error("Unknown command", "command", rawCMD)
 				writer := resp.NewWriter(p.conn)
@@ -254,6 +275,7 @@ func (p *Peer) readLoop() error {
 	}
 	return nil
 }
+
 func (p *Peer) IsActive() bool {
 	return time.Since(p.lastActivity) < time.Minute
 }
