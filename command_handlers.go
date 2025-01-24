@@ -202,34 +202,42 @@ func (h *CommandHandler) HandleReplHandshake(cmd ReplHandshakeCommand, peer *Pee
 }
 
 func (h *CommandHandler) handleSync(peer *Peer) error {
-	slog.Info("Starting sync process")
 
-	h.kv.mu.RLock()
-	defer h.kv.mu.RUnlock()
+	go func() {
 
-	writer := resp.NewWriter(peer.conn)
+		slog.Info("Starting sync process")
 
-	for key, value := range h.kv.data {
+		h.kv.mu.RLock()
+		defer h.kv.mu.RUnlock()
+
+		writer := resp.NewWriter(peer.conn)
+
+		for key, value := range h.kv.data {
+			err := writer.WriteArray([]resp.Value{
+				resp.StringValue(ReplData),
+				resp.StringValue(key),
+				resp.BytesValue(value.Value),
+			})
+			if err != nil {
+				slog.Error("Failed to send data", "error", err)
+				return
+			}
+			slog.Info("Sent key during sync", "key", key)
+		}
+
 		err := writer.WriteArray([]resp.Value{
-			resp.StringValue(ReplData),
-			resp.StringValue(key),
-			resp.BytesValue(value.Value),
+			resp.StringValue(ReplEnd),
 		})
 		if err != nil {
-			return fmt.Errorf("failed to send data: %w", err)
+			slog.Error("Failed to send sync end", "error", err)
+			return
 		}
-		slog.Info("Sent key during sync", "key", key)
-	}
 
-	err := writer.WriteArray([]resp.Value{
-		resp.StringValue(ReplEnd),
-	})
-	if err != nil {
-		return fmt.Errorf("failed to send sync end: %w", err)
-	}
+		slog.Info("Sync completed")
 
-	slog.Info("Sync completed")
+	}()
 	return nil
+
 }
 
 func (h *CommandHandler) handleCommand(cmd Command, peer *Peer) error {
