@@ -29,7 +29,7 @@ GoKeyDB is a high-performance, distributed key-value store designed for scalabil
 ### Steps
 1. Clone the repository:
    ```bash
-   git clone https://github.com/yourusername/gokeydb.git
+   git clone https://github.com/XIN2025/gokeydb.git
    cd gokeydb
    ```
 
@@ -138,10 +138,7 @@ go test ./...
 4. Push: `git push origin feat/new-feature`
 5. Submit a pull request
 
-See [CONTRIBUTING](CONTRIBUTING.md) for details.
 
-## License
-MIT License. See [LICENSE](LICENSE).
 
 ## FAQ
 
@@ -154,5 +151,3 @@ A: Data is in-memory. Snapshots are saved to dataDir.
 **Q: How to reset the database?**  
 A: Stop the server, delete dataDir, and restart.
 
-**Q: Is this production-ready?**  
-A: GoKeyDB is a learning project. Use it for experiments.
