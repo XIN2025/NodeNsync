@@ -1,9 +1,9 @@
-# GoKeyDB — Distributed Key-Value Store
+# NodeNsync — Distributed Key-Value Store
 
 ![Go](https://img.shields.io/badge/Go-1.21+-blue)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
-GoKeyDB is a high-performance, distributed key-value store designed for scalability and fault tolerance. It supports clustering, replication, pub/sub messaging, and snapshot-based persistence, making it ideal for applications requiring fast data access with resilience.
+NodeNsync is a high-performance, distributed key-value store designed for scalability and fault tolerance. It supports clustering, replication, pub/sub messaging, and snapshot-based persistence, making it ideal for applications requiring fast data access with resilience.
 
 ---
 
@@ -29,18 +29,18 @@ GoKeyDB is a high-performance, distributed key-value store designed for scalabil
 ### Steps
 1. Clone the repository:
    ```bash
-   git clone https://github.com/XIN2025/gokeydb.git
-   cd gokeydb
+   git clone https://github.com/XIN2025/NodeNsync.git
+   cd NodeNsync
    ```
 
 2. Build the binary:
    ```bash
-   go build -o gokeydb cmd/server/main.go
+   go build -o NodeNsync cmd/server/main.go
    ```
 
 3. Start the server (default: :6379):
    ```bash
-   ./gokeydb --listenAddr :6379
+   ./NodeNsync --listenAddr :6379
    ```
 
 ## Configuration
@@ -54,7 +54,7 @@ GoKeyDB is a high-performance, distributed key-value store designed for scalabil
 
 Example:
 ```bash
-./gokeydb --listenAddr :6380 --dataDir /mnt/data --rateLimit 10
+./NodeNsync --listenAddr :6380 --dataDir /mnt/data --rateLimit 10
 ```
 
 ## Usage
@@ -87,7 +87,7 @@ OK
 ### Clustering
 Start additional nodes:
 ```bash
-./gokeydb --listenAddr :6381
+./NodeNsync --listenAddr :6381
 ```
 
 Join nodes via CLI:
@@ -142,8 +142,8 @@ go test ./...
 
 ## FAQ
 
-**Q: Can I use Redis clients with GoKeyDB?**  
-A: Yes! GoKeyDB uses the RESP protocol for compatibility.
+**Q: Can I use Redis clients with NodeNsync?**  
+A: Yes! NodeNsync uses the RESP protocol for compatibility.
 
 **Q: Where is data stored?**  
 A: Data is in-memory. Snapshots are saved to dataDir.
