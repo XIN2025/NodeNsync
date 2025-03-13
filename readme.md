@@ -1,4 +1,3 @@
-(Due to technical issues, the search service is temporarily unavailable.)
 
 # NodeNsync — Distributed Key-Value Store
 
