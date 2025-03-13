@@ -1,3 +1,5 @@
+(Due to technical issues, the search service is temporarily unavailable.)
+
 # NodeNsync — Distributed Key-Value Store
 
 ![Go](https://img.shields.io/badge/Go-1.21+-blue)
@@ -14,9 +16,10 @@ NodeNsync is a high-performance, distributed key-value store designed for scalab
 - **Persistence**: Periodic snapshots to disk for recovery.
 - **Pub/Sub Messaging**: Real-time message broadcasting.
 - **Role-Based Access**: Admin/user roles with session tokens.
-- **RESP Protocol Support**: Compatible with standard CLI tools.
+- **RESP Protocol Support**: Compatible with standard Redis CLI tools.
 - **Rate Limiting**: Protect against abusive clients.
 - **Health Monitoring**: Track connections, latency, and memory usage.
+- **TLS Support**: Secure client-server communication.
 
 ---
 
@@ -29,18 +32,18 @@ NodeNsync is a high-performance, distributed key-value store designed for scalab
 ### Steps
 1. Clone the repository:
    ```bash
-   git clone https://github.com/XIN2025/NodeNsync.git
-   cd NodeNsync
+   git clone https://github.com/yourusername/nodensync.git
+   cd nodensync
    ```
 
 2. Build the binary:
    ```bash
-   go build -o NodeNsync cmd/server/main.go
+   go build -o nodensync cmd/server/main.go
    ```
 
 3. Start the server (default: :6379):
    ```bash
-   ./NodeNsync --listenAddr :6379
+   ./nodensync --listenAddr :6379
    ```
 
 ## Configuration
@@ -51,103 +54,170 @@ NodeNsync is a high-performance, distributed key-value store designed for scalab
 | `--dataDir` | Directory for snapshots | `./data` |
 | `--snapshotInterval` | Auto-snapshot interval | `1m` |
 | `--rateLimit` | Max commands/sec per client | `3` |
+| `--enableTLS` | Enable TLS encryption | `false` |
 
 Example:
 ```bash
-./NodeNsync --listenAddr :6380 --dataDir /mnt/data --rateLimit 10
+./nodensync --listenAddr :6380 --dataDir /mnt/data --rateLimit 10 --enableTLS
 ```
 
-## Usage
+---
 
-### Connect with Redis CLI
-```bash
-redis-cli -p 6379
-```
+## Command Reference
 
-### Basic Commands
-Set/Get Keys:
-```redis
-127.0.0.1:6379> SET user:1 "Alice"
-OK
-127.0.0.1:6379> GET user:1
-"Alice"
-```
+### Core Commands
+| Command | Syntax | Description |
+|---------|--------|-------------|
+| **AUTH** | `AUTH <username> <password>` | Authenticate with role-based access |
+| **SET** | `SET <key> <value>` | Store a key-value pair |
+| **GET** | `GET <key>` | Retrieve value by key |
+| **DEL** | `DEL <key>` | Delete a key |
+| **INCR** | `INCR <key>` | Atomically increment integer value |
 
-### Pub/Sub Messaging
-```redis
-# Terminal 1 (Subscriber):
-127.0.0.1:6379> SUBSCRIBE updates
+### Hash Commands
+| Command | Syntax | Description |
+|---------|--------|-------------|
+| **HSET** | `HSET <key> <field> <value>` | Set hash field value |
+| **HGET** | `HGET <key> <field>` | Get hash field value |
 
-# Terminal 2 (Publisher):
-127.0.0.1:6379> PUBLISH updates "New data!"
-```
+### Pub/Sub Commands
+| Command | Syntax | Description |
+|---------|--------|-------------|
+| **PUBLISH** | `PUBLISH <channel> <message>` | Broadcast message to channel |
+| **SUBSCRIBE** | `SUBSCRIBE <channel>` | Receive messages from channel |
+| **UNSUBSCRIBE** | `UNSUBSCRIBE [channel...]` | Stop listening to channels |
+
+### Administration
+| Command | Syntax | Description |
+|---------|--------|-------------|
+| **INFO** | `INFO` | Get server statistics & metrics |
+| **ROLE** | `ROLE` | Show node role (leader/follower) |
+| **REPLICAOF** | `REPLICAOF <host> <port>` | Configure replication |
+| **MONITOR** | `MONITOR` | Stream all executed commands |
+
+### Utility
+| Command | Syntax | Description |
+|---------|--------|-------------|
+| **PING** | `PING` | Check server responsiveness |
+| **HELP** | `HELP` | List available commands |
+
+---
 
 ## Advanced Features
 
-### Clustering
-Start additional nodes:
+### Clustering Example
+Start 3-node cluster:
 ```bash
-./NodeNsync --listenAddr :6381
+# Node 1 (Leader)
+./nodensync --listenAddr :7000
+
+# Node 2
+./nodensync --listenAddr :7001
+
+# Node 3
+./nodensync --listenAddr :7002
 ```
 
-Join nodes via CLI:
+Join cluster via Redis CLI:
 ```redis
-REPLICAOF host port  # Promote to leader
+REPLICAOF 127.0.0.1 7000
 ```
 
-### Replication
-Configure a node as a replica:
+### Replication Setup
+Configure node as replica:
 ```redis
-REPLICAOF 127.0.0.1 6379
+127.0.0.1:6380> REPLICAOF 127.0.0.1 6379
 ```
 
-### Persistence
-Manual snapshot:
+### Persistence Management
+Manual snapshot creation:
 ```redis
 SAVE
 ```
 
-## Monitoring
+---
+
+## Monitoring & Metrics
+
+### INFO Output Example
 ```redis
 127.0.0.1:6379> INFO
 # Server
 version:1.0.0
-connected_clients:5
-used_memory:128MB
+uptime:2h35m
+connected_clients:8
+used_memory:256MB
 
 # Replication
 role:master
-connected_replicas:2
+connected_slaves:2
+master_repl_offset:89234
+
+# Keyspace
+db0:keys=1532
 ```
+
+---
+
+## Security
+
+### TLS Configuration
+1. Generate certificates:
+   ```bash
+   openssl req -x509 -newkey rsa:4096 -nodes -keyout key.pem -out cert.pem -days 365
+   ```
+
+2. Start server with TLS:
+   ```bash
+   ./nodensync --enableTLS --tlsCert cert.pem --tlsKey key.pem
+   ```
+
+3. Connect with Redis CLI:
+   ```bash
+   redis-cli --tls --cert ./cert.pem --key ./key.pem -p 6379
+   ```
+
+---
 
 ## Building from Source
-Install dependencies:
-```bash
-go get github.com/tidwall/resp
-```
 
-Run tests:
-```bash
-go test ./...
-```
+1. Install dependencies:
+   ```bash
+   go get github.com/tidwall/resp
+   ```
+
+2. Run tests:
+   ```bash
+   go test ./...
+   ```
+
+3. Build with optimizations:
+   ```bash
+   go build -ldflags "-s -w" -o nodensync cmd/server/main.go
+   ```
+
+---
 
 ## Contributing
+
 1. Fork the repository
-2. Create a feature branch: `git checkout -b feat/new-feature`
-3. Commit changes: `git commit -am 'Add feature'`
+2. Create feature branch: `git checkout -b feat/new-feature`
+3. Commit changes: `git commit -am 'Add awesome feature'`
 4. Push: `git push origin feat/new-feature`
-5. Submit a pull request
+5. Submit pull request
 
-
+---
 
 ## FAQ
 
-**Q: Can I use Redis clients with NodeNsync?**  
-A: Yes! NodeNsync uses the RESP protocol for compatibility.
+**Q: How is this different from Redis?**  
+A: NodeNsync focuses on horizontal scaling and simplicity, while maintaining Redis protocol compatibility.
 
-**Q: Where is data stored?**  
-A: Data is in-memory. Snapshots are saved to dataDir.
+**Q: Can I use existing Redis clients?**  
+A: Yes! Any RESP-compatible client (redis-py, Jedis, etc.) will work.
+
+**Q: Where are snapshots stored?**  
+A: In the `dataDir` specified at startup (default: `./data`).
 
 **Q: How to reset the database?**  
-A: Stop the server, delete dataDir, and restart.
-
+A: Stop server and delete all `.json` files in the data directory.
